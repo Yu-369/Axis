@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Pose Director MVP</title>
+    
+    <!-- MediaPipe CDNs -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; padding: 20px; font-family: monospace; transition: background-color 0.3s; }
+        #videoElement { display: none; } 
+        #canvasElement { border: 2px solid #333; background-color: #000; max-width: 100%; }
+        .controls { margin-bottom: 15px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; margin-right: 10px; }
+    </style>
+</head>
+<body>
+
+    <div class="controls">
+        <button id="startBtn">1. Start System</button>
+        <button id="calibrateBtn" disabled>2. Recalibrate Posture</button>
+    </div>
+    
+    <video id="videoElement" autoplay playsinline></video>
+    <canvas id="canvasElement" width="640" height="480"></canvas>
+
+    <script>
+        // ==========================================
+        // --- CONFIGURATION CONSTANTS ---
+        // ==========================================
+        // 0.93 means you can only drop 7% from your perfect baseline before the alarm sounds.
+        // Increase to 0.95 for extreme strictness, decrease to 0.85 for leniency.
+        const STRICTNESS_THRESHOLD = 0.93; 
+        
+        // 0.25 means the system reacts quickly to new movements.
+        // Increase to 0.40 for instant reaction, decrease to 0.10 for slower reaction.
+        const REACTION_SPEED = 0.25; 
+        // ==========================================
+
+        // --- DOM Elements ---
+        const videoElement = document.getElementById('videoElement');
+        const canvasElement = document.getElementById('canvasElement');
+        const canvasCtx = canvasElement.getContext('2d');
+        const startBtn = document.getElementById('startBtn');
+        const calibrateBtn = document.getElementById('calibrateBtn');
+
+        // --- System State Variables ---
+        let audioCtx = null;
+        let alarmGain = null;
+        
+        let absenceTimeout = null;
+        let isSecured = false;
+
+        let baselinePostureRatio = null;
+        let smoothedRatio = null;
+        let isSlouching = false;
+
+        // --- Helper: 3D Distance Calculator ---
+        function getDistance3D(p1, p2) {
+            return Math.sqrt(
+                Math.pow(p2.x - p1.x, 2) + 
+                Math.pow(p2.y - p1.y, 2) + 
+                Math.pow(p2.z - p1.z, 2)
+            );
+        }
+
+        // --- Audio: Continuous Alarm System ---
+        function initAudio() {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            audioCtx = new AudioContext();
+            
+            const oscillator = audioCtx.createOscillator();
+            alarmGain = audioCtx.createGain();
+            
+            oscillator.type = 'sawtooth'; 
+            oscillator.frequency.value = 440; 
+            
+            alarmGain.gain.value = 0; // Start muted
+            
+            oscillator.connect(alarmGain);
+            alarmGain.connect(audioCtx.destination);
+            oscillator.start();
+        }
+
+        function toggleAlarm(play) {
+            if (!alarmGain) return;
+            // Smoothly ramp volume to prevent audio clicking
+            alarmGain.gain.setTargetAtTime(play ? 0.05 : 0, audioCtx.currentTime, 0.05);
+        }
+
+        // --- Logic 1: The Slouch Cop (Hybrid 2D/3D Math) ---
+        function handleSlouchCop(poseLandmarks) {
+            const LEFT_EAR = poseLandmarks[7];
+            const RIGHT_EAR = poseLandmarks[8];
+            const LEFT_SHOULDER = poseLandmarks[11];
+            const RIGHT_SHOULDER = poseLandmarks[12];
+
+            // 1. The Slouch Indicator (2D Y-Axis Drop)
+            const headMidpointY = (LEFT_EAR.y + RIGHT_EAR.y) / 2;
+            const shoulderMidpointY = (LEFT_SHOULDER.y + RIGHT_SHOULDER.y) / 2;
+            const verticalDrop2D = shoulderMidpointY - headMidpointY;
+
+            // 2. The Scale Reference (3D Shoulder Width)
+            const shoulderWidth3D = getDistance3D(LEFT_SHOULDER, RIGHT_SHOULDER);
+
+            if (shoulderWidth3D < 0.01) return; // Prevent division by zero
+
+            // 3. Calculate Hybrid Ratio
+            const rawRatio = verticalDrop2D / shoulderWidth3D;
+
+            // 4. Apply Exponential Moving Average (EMA) Smoothing
+            if (smoothedRatio === null) smoothedRatio = rawRatio;
+            smoothedRatio = (rawRatio * REACTION_SPEED) + (smoothedRatio * (1 - REACTION_SPEED));
+
+            // 5. Auto-Calibration
+            if (baselinePostureRatio === null) {
+                baselinePostureRatio = smoothedRatio;
+                calibrateBtn.disabled = false;
+            }
+
+            // 6. Slouch Detection (Strict Threshold)
+            const slouchThreshold = baselinePostureRatio * STRICTNESS_THRESHOLD;
+
+            if (smoothedRatio < slouchThreshold) {
+                isSlouching = true;
+                toggleAlarm(true);
+            } else {
+                isSlouching = false;
+                toggleAlarm(false);
+            }
+
+            return { smoothedRatio, slouchThreshold };
+        }
+
+        // --- Logic 2: The Auto-Lock Security Timer ---
+        function handleSecurityTimer(hasHuman) {
+            if (!hasHuman) {
+                toggleAlarm(false); // Mute alarm if user leaves frame
+
+                if (!absenceTimeout && !isSecured) {
+                    absenceTimeout = setTimeout(() => {
+                        isSecured = true;
+                        document.body.style.backgroundColor = '#8b0000';
+                        baselinePostureRatio = null; // Reset posture baseline
+                        smoothedRatio = null;
+                    }, 5000);
+                }
+            } else {
+                if (absenceTimeout) {
+                    clearTimeout(absenceTimeout);
+                    absenceTimeout = null;
+                }
+                if (isSecured) {
+                    isSecured = false;
+                    document.body.style.backgroundColor = ''; 
+                }
+            }
+        }
+
+        // --- MediaPipe Callback ---
+        function onResults(results) {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            const hasHuman = results.poseLandmarks != null;
+
+            handleSecurityTimer(hasHuman);
+
+            if (isSecured) {
+                canvasCtx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+                canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+                
+                canvasCtx.fillStyle = '#FF3333';
+                canvasCtx.font = 'bold 48px monospace';
+                canvasCtx.textAlign = 'center';
+                canvasCtx.fillText('SYSTEM SECURED', canvasElement.width / 2, canvasElement.height / 2);
+            } 
+            else if (hasHuman) {
+                const stats = handleSlouchCop(results.poseLandmarks);
+
+                drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, { color: '#ffffff', lineWidth: 2 });
+                drawLandmarks(canvasCtx, results.poseLandmarks, { color: isSlouching ? '#FF0000' : '#00FF00', lineWidth: 2 });
+
+                if (stats) {
+                    canvasCtx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                    canvasCtx.fillRect(10, 10, 340, 90);
+
+                    canvasCtx.fillStyle = isSlouching ? '#FF3333' : '#33FF33';
+                    canvasCtx.font = '20px monospace';
+                    canvasCtx.textAlign = 'left';
+                    canvasCtx.fillText(`STATUS: ${isSlouching ? 'SLOUCHING DETECTED' : 'GOOD POSTURE'}`, 20, 40);
+                    
+                    canvasCtx.fillStyle = '#FFFFFF';
+                    canvasCtx.font = '14px monospace';
+                    canvasCtx.fillText(`Smoothed Ratio: ${stats.smoothedRatio.toFixed(3)}`, 20, 65);
+                    canvasCtx.fillText(`Alarm Threshold: < ${stats.slouchThreshold.toFixed(3)}`, 20, 85);
+                }
+            }
+
+            canvasCtx.restore();
+        }
+
+        // --- Initialization ---
+        const pose = new Pose({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+        });
+
+        pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        
+        pose.onResults(onResults);
+
+        startBtn.addEventListener('click', () => {
+            startBtn.disabled = true;
+            startBtn.innerText = "System Running...";
+            
+            initAudio();
+
+            const camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    await pose.send({ image: videoElement });
+                },
+                width: 640,
+                height: 480
+            });
+            camera.start();
+        });
+
+        calibrateBtn.addEventListener('click', () => {
+            baselinePostureRatio = null; 
+            smoothedRatio = null;
+        });
+    </script>
+</body>
+</html>
